@@ -1,0 +1,253 @@
+// Persistência em PostgreSQL (Supabase) com Row Level Security.
+//
+// O isolamento entre usuários é garantido em DUAS camadas independentes:
+//
+//   1. Aplicação — o `userId` sempre vem do JWT verificado no servidor
+//      (middleware requireAuth), nunca de body/query/params.
+//   2. Banco — toda tabela com `user_id` tem RLS habilitada com FORCE, e a
+//      API conecta com um role sem BYPASSRLS. Mesmo que um bug de aplicação
+//      esqueça um `where`, o Postgres devolve zero linhas.
+//
+// A política compara `user_id` com `current_setting('app.current_user_id')`,
+// definido por transação em `prismaFor()` (src/lib/prisma.ts).
+//
+// Convenções mantidas da fase anterior:
+// - Valores monetários em inteiro (centavos), nunca Float — sem erro de ponto
+//   flutuante em soma de dinheiro.
+// - Sem `enum` nativo: os conjuntos fechados são String validada por Zod na
+//   borda da API, o que mantém as migrations simples e reversíveis.
+// - IDs gerados pelo Prisma Client (cuid), não por função do banco.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  categories            Category[]
+  transactions          Transaction[]
+  recurringTransactions RecurringTransaction[]
+  settings              UserSettings?
+  passwordResetTokens   PasswordResetToken[]
+  importFiles           ImportFile[]
+  importedTransactions  ImportedTransaction[]
+  categorizationRules   CategorizationRule[]
+
+  @@map("users")
+}
+
+/// type: "income" | "expense"
+model Category {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  name      String
+  type      String
+  color     String   @default("#64748b")
+  icon      String   @default("Tag")
+  /// Categorias criadas no registro. Não podem ser excluídas se houver
+  /// lançamentos apontando para elas — ver category.service.
+  isDefault Boolean  @default(false) @map("is_default")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user                  User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions          Transaction[]
+  recurringTransactions RecurringTransaction[]
+  importedTransactions  ImportedTransaction[]
+  categorizationRules   CategorizationRule[]
+
+  @@unique([userId, name, type])
+  @@index([userId])
+  @@map("categories")
+}
+
+/// type: "income" | "fixed_expense" | "variable_expense"
+/// source: "manual" | "recurring" | "import"
+model Transaction {
+  id                     String    @id @default(cuid())
+  userId                 String    @map("user_id")
+  categoryId             String    @map("category_id")
+  description            String
+  amountCents            Int       @map("amount_cents")
+  type                   String
+  date                   DateTime  @db.Date
+  source                 String    @default("manual")
+  /// FITID do OFX (ou hash estável do CSV/PDF). É a chave de duplicidade mais
+  /// confiável: o banco garante que a mesma movimentação não entre duas vezes.
+  externalId             String?   @map("external_id")
+  importFileId           String?   @map("import_file_id")
+  recurringTransactionId String?   @map("recurring_transaction_id")
+  /// Preenchido só quando gerado a partir de uma recorrência, formato "YYYY-MM".
+  /// Junto com recurringTransactionId, o @@unique garante que a ocorrência de
+  /// um mês nunca seja materializada duas vezes.
+  occurrenceMonth        String?   @map("occurrence_month")
+  /// Soft delete. Necessário para recorrência: apagar "Aluguel de agosto" tem
+  /// que ser permanente, e a linha precisa continuar ocupando o slot do
+  /// @@unique abaixo para que ensureMonthMaterialized não a recrie.
+  deletedAt              DateTime? @map("deleted_at")
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
+
+  user                 User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category             Category              @relation(fields: [categoryId], references: [id])
+  recurringTransaction RecurringTransaction? @relation(fields: [recurringTransactionId], references: [id], onDelete: SetNull)
+  importFile           ImportFile?           @relation(fields: [importFileId], references: [id], onDelete: SetNull)
+
+  @@unique([recurringTransactionId, occurrenceMonth])
+  @@unique([userId, externalId])
+  @@index([userId, date])
+  @@index([userId, type])
+  @@index([categoryId])
+  @@map("transactions")
+}
+
+/// type: "income" | "fixed_expense"
+model RecurringTransaction {
+  id          String   @id @default(cuid())
+  userId      String   @map("user_id")
+  categoryId  String   @map("category_id")
+  description String
+  amountCents Int      @map("amount_cents")
+  type        String
+  dayOfMonth  Int      @map("day_of_month")
+  /// "YYYY-MM" — a partir de quando a recorrência vale. Sem isso a
+  /// materialização retroagiria indefinidamente ao navegar para meses antigos.
+  startMonth  String   @map("start_month")
+  /// "YYYY-MM" — opcional, para recorrências com fim previsto (ex: 12 parcelas).
+  endMonth    String?  @map("end_month")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category    Category      @relation(fields: [categoryId], references: [id])
+  occurrences Transaction[]
+
+  @@index([userId])
+  @@index([userId, active])
+  @@map("recurring_transactions")
+}
+
+model UserSettings {
+  id                   String   @id @default(cuid())
+  userId               String   @unique @map("user_id")
+  investmentPercentage Int      @default(20) @map("investment_percentage")
+  createdAt            DateTime @default(now()) @map("created_at")
+  updatedAt            DateTime @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+/// format: "csv" | "ofx" | "pdf"
+/// status: "pending" | "confirmed" | "discarded"
+model ImportFile {
+  id            String   @id @default(cuid())
+  userId        String   @map("user_id")
+  filename      String
+  format        String
+  sizeBytes     Int      @map("size_bytes")
+  status        String   @default("pending")
+  totalRows     Int      @default(0) @map("total_rows")
+  importedCount Int      @default(0) @map("imported_count")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  user         User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rows         ImportedTransaction[]
+  transactions Transaction[]
+
+  @@index([userId])
+  @@map("import_files")
+}
+
+/// Staging: o que foi lido do extrato, ANTES da confirmação do usuário.
+/// Nada daqui vira Transaction sem um POST /imports/:id/confirm explícito.
+///
+/// direction: "in" | "out"
+/// type: "income" | "fixed_expense" | "variable_expense"
+/// status: "pending" | "imported" | "ignored"
+/// duplicateAction: "ignore" | "import_anyway" | "merge"
+/// suggestionSource: "user_rule" | "merchant" | "fallback"
+model ImportedTransaction {
+  id               String   @id @default(cuid())
+  userId           String   @map("user_id")
+  importFileId     String   @map("import_file_id")
+  date             DateTime @db.Date
+  /// Descrição crua do banco, preservada para auditoria e para gerar a regra
+  /// de aprendizado. A `description` é a versão editável pelo usuário.
+  rawDescription   String   @map("raw_description")
+  description      String
+  amountCents      Int      @map("amount_cents")
+  direction        String
+  type             String
+  categoryId       String?  @map("category_id")
+  externalId       String?  @map("external_id")
+  selected         Boolean  @default(true)
+  status           String   @default("pending")
+  suggestionSource String?  @map("suggestion_source")
+  /// Transaction já existente que provavelmente é a mesma movimentação.
+  duplicateOfId    String?  @map("duplicate_of_id")
+  duplicateScore   Float?   @map("duplicate_score")
+  duplicateAction  String?  @map("duplicate_action")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  importFile ImportFile @relation(fields: [importFileId], references: [id], onDelete: Cascade)
+  category   Category?  @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([importFileId])
+  @@map("imported_transactions")
+}
+
+/// Aprendizado de categorização por usuário (§15 do prompt).
+/// `pattern` é a descrição do extrato já normalizada (ver lib/classification).
+///
+/// source: "user" (o usuário corrigiu) | "system" (semeada do dicionário)
+model CategorizationRule {
+  id         String   @id @default(cuid())
+  userId     String   @map("user_id")
+  categoryId String   @map("category_id")
+  pattern    String
+  type       String
+  hitCount   Int      @default(1) @map("hit_count")
+  source     String   @default("user")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, pattern])
+  @@index([userId])
+  @@map("categorization_rules")
+}
